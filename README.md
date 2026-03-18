@@ -70,10 +70,10 @@ Open `http://localhost:5173` in your browser.
 ## Authors
 
 **Swan Yi Htet** — Columbia University, Fu Foundation School of Engineering and Applied Science
-Terrain physics, rover dynamics, sensor modeling, algorithm design
+[Terrain physics, rover dynamics, sensor modeling, algorithm design]
 
-**David Young** — University of Pennsylvania
-Pathfinding architecture, search visualization, perception logic
+**David Young** — University of Pennsylvania, Computer Engineering
+[Pathfinding architecture, search visualization, perception logic]
 
 ## License
 
