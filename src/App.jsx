@@ -47,6 +47,10 @@ function fbm(x, y, noise, octaves) {
 const MAX_HEIGHT = 10;
 let _roughness = 1.0;
 let _craterDensity = 0.5;
+let _terrainColor = [0.6, 0.26, 0.11]; // RGB base
+let _terrainColorVariance = 0.3; // how much height affects color
+let _rockColors = [0x6b3a23, 0x5a3020, 0x7a4530];
+let _heightScale = 1.0;
 
 // Deterministic craters: divide world into cells, hash cell coords for crater placement
 function cellHash(cx, cz) {
@@ -99,7 +103,7 @@ function getWorldHeight(wx, wz) {
       }
     }
   }
-  return h * MAX_HEIGHT;
+  return h * MAX_HEIGHT * _heightScale;
 }
 
 function getWorldSlope(wx, wz) {
@@ -141,11 +145,12 @@ function buildChunkMesh(cx, cz) {
     const h = getWorldHeight(wx, wz);
     pos.setY(i, h);
     const sl = getWorldSlope(wx, wz);
-    const t = (h / MAX_HEIGHT + 0.5) * 0.5;
+    const t = (h / (MAX_HEIGHT * _heightScale) + 0.5) * 0.5;
     const dark = sl > 1.5 ? 0.82 : 1;
-    colors[i * 3] = (0.6 + t * 0.3) * dark;
-    colors[i * 3 + 1] = (0.26 + t * 0.16) * dark;
-    colors[i * 3 + 2] = (0.11 + t * 0.06) * dark;
+    const v = _terrainColorVariance;
+    colors[i * 3] = (_terrainColor[0] + t * v) * dark;
+    colors[i * 3 + 1] = (_terrainColor[1] + t * v * 0.5) * dark;
+    colors[i * 3 + 2] = (_terrainColor[2] + t * v * 0.2) * dark;
   }
 
   geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
@@ -175,9 +180,9 @@ function buildChunkRocks(cx, cz) {
     new THREE.TetrahedronGeometry(1, 0),
   ];
   const rockMats = [
-    new THREE.MeshStandardMaterial({ color: 0x6b3a23, roughness: 0.95, flatShading: true }),
-    new THREE.MeshStandardMaterial({ color: 0x5a3020, roughness: 0.95, flatShading: true }),
-    new THREE.MeshStandardMaterial({ color: 0x7a4530, roughness: 0.95, flatShading: true }),
+    new THREE.MeshStandardMaterial({ color: _rockColors[0], roughness: 0.95, flatShading: true }),
+    new THREE.MeshStandardMaterial({ color: _rockColors[1], roughness: 0.95, flatShading: true }),
+    new THREE.MeshStandardMaterial({ color: _rockColors[2], roughness: 0.95, flatShading: true }),
   ];
 
   for (let i = 0; i < numRocks; i++) {
@@ -212,9 +217,25 @@ function buildChunkHazard(cx, cz) {
     const h = getWorldHeight(wx, wz);
     pos.setY(i, h + 0.15);
     const sl = getWorldSlope(wx, wz);
-    if (sl > 3.5) { colors[i*4]=1; colors[i*4+1]=0.1; colors[i*4+2]=0.1; colors[i*4+3]=0.35; }
-    else if (sl > 2) { colors[i*4]=1; colors[i*4+1]=0.65; colors[i*4+2]=0; colors[i*4+3]=0.2; }
-    else { colors[i*4]=0.1; colors[i*4+1]=0.85; colors[i*4+2]=0.3; colors[i*4+3]=0.06; }
+    // Continuous traversability gradient: green → yellow → orange → red
+    const t = Math.min(1, sl / 4.5); // normalize slope to 0-1
+    let r, g, b, a;
+    if (t < 0.3) {
+      // Green zone (safe) — low opacity
+      r = 0.1 + t * 2; g = 0.85 - t * 0.5; b = 0.3 - t * 0.5;
+      a = 0.04 + t * 0.15;
+    } else if (t < 0.6) {
+      // Yellow-orange zone (caution)
+      const u = (t - 0.3) / 0.3;
+      r = 0.7 + u * 0.3; g = 0.7 - u * 0.4; b = 0.1;
+      a = 0.12 + u * 0.12;
+    } else {
+      // Red zone (danger)
+      const u = (t - 0.6) / 0.4;
+      r = 1.0; g = 0.3 - u * 0.25; b = 0.1;
+      a = 0.24 + u * 0.16;
+    }
+    colors[i*4] = r; colors[i*4+1] = g; colors[i*4+2] = b; colors[i*4+3] = a;
   }
 
   geo.setAttribute("color", new THREE.BufferAttribute(colors, 4));
@@ -342,11 +363,307 @@ function smoothPath(path) {
   return s;
 }
 
+// ============ DIJKSTRA STEPPER ============
+class DijkstraStepper {
+  constructor(startW, endW) {
+    this.STEP = ASTAR_STEP;
+    this.sx = Math.round(startW[0] / this.STEP);
+    this.sz = Math.round(startW[1] / this.STEP);
+    this.ex = Math.round(endW[0] / this.STEP);
+    this.ez = Math.round(endW[1] / this.STEP);
+    this.open = new Map();
+    this.closed = new Map();
+    this.gScore = new Map();
+    this.parent = new Map();
+    this.dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
+    this.done = false;
+    this.found = false;
+    this.path = null;
+    this.iters = 0;
+    this.maxCostSeen = 1;
+    const startKey = `${this.sx},${this.sz}`;
+    this.gScore.set(startKey, 0);
+    this.open.set(startKey, { x: this.sx, z: this.sz, f: 0 });
+  }
+  step(n = 1) {
+    for (let s = 0; s < n; s++) {
+      if (this.done || this.open.size === 0) { this.done = true; return; }
+      this.iters++;
+      if (this.iters > 50000) { this.done = true; return; }
+      let bestKey = null, bestF = Infinity;
+      for (const [k, v] of this.open) { if (v.f < bestF) { bestF = v.f; bestKey = k; } }
+      const curr = this.open.get(bestKey);
+      this.open.delete(bestKey);
+      const cost = this.gScore.get(bestKey) || 0;
+      this.closed.set(bestKey, { x: curr.x, z: curr.z, cost });
+      if (cost > this.maxCostSeen) this.maxCostSeen = cost;
+      if (curr.x === this.ex && curr.z === this.ez) {
+        const path = [];
+        let ck = bestKey;
+        while (ck) { const [px, pz] = ck.split(",").map(Number); path.unshift([px * this.STEP, pz * this.STEP]); ck = this.parent.get(ck); }
+        this.path = path; this.found = true; this.done = true; return;
+      }
+      for (const [dx, dz] of this.dirs) {
+        const nx = curr.x + dx, nz = curr.z + dz;
+        const nk = `${nx},${nz}`;
+        if (this.closed.has(nk)) continue;
+        const wx = nx * this.STEP, wz = nz * this.STEP;
+        const slope = getWorldSlope(wx, wz);
+        const slopeCost = slope > 3.5 ? 200 : slope > 2 ? 15 : 1 + slope * 2;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        const ng = (this.gScore.get(bestKey) || 0) + dist * slopeCost;
+        if (!this.gScore.has(nk) || ng < this.gScore.get(nk)) {
+          this.gScore.set(nk, ng);
+          this.parent.set(nk, bestKey);
+          this.open.set(nk, { x: nx, z: nz, f: ng }); // No heuristic — pure cost
+        }
+      }
+    }
+  }
+  getClosedPositions() {
+    const pts = [];
+    for (const [, v] of this.closed) { pts.push({ x: v.x * this.STEP, z: v.z * this.STEP, cost: v.cost }); }
+    return pts;
+  }
+  getOpenPositions() {
+    const pts = [];
+    for (const [, v] of this.open) { pts.push({ x: v.x * this.STEP, z: v.z * this.STEP }); }
+    return pts;
+  }
+}
+
+// ============ RRT STEPPER (Rapidly-exploring Random Trees) ============
+class RRTStepper {
+  constructor(startW, endW) {
+    this.STEP = ASTAR_STEP;
+    this.sx = startW[0]; this.sz = startW[1];
+    this.ex = endW[0]; this.ez = endW[1];
+    this.nodes = [{ x: this.sx, z: this.sz, parent: -1, cost: 0 }];
+    this.done = false;
+    this.found = false;
+    this.path = null;
+    this.iters = 0;
+    this.maxCostSeen = 1;
+    this.goalRadius = this.STEP * 2.5;
+    this.extendDist = this.STEP * 1.8;
+    // Bounding box for random sampling — area between start and goal + margin
+    const margin = 80;
+    this.minX = Math.min(this.sx, this.ex) - margin;
+    this.maxX = Math.max(this.sx, this.ex) + margin;
+    this.minZ = Math.min(this.sz, this.ez) - margin;
+    this.maxZ = Math.max(this.sz, this.ez) + margin;
+  }
+  step(n = 1) {
+    for (let s = 0; s < n; s++) {
+      if (this.done) return;
+      this.iters++;
+      if (this.iters > 50000) { this.done = true; return; }
+      // Bias toward goal 15% of the time
+      let randX, randZ;
+      if (Math.random() < 0.15) {
+        randX = this.ex; randZ = this.ez;
+      } else {
+        randX = this.minX + Math.random() * (this.maxX - this.minX);
+        randZ = this.minZ + Math.random() * (this.maxZ - this.minZ);
+      }
+      // Find nearest node
+      let nearIdx = 0, nearDist = Infinity;
+      for (let i = 0; i < this.nodes.length; i++) {
+        const d = Math.sqrt((this.nodes[i].x - randX) ** 2 + (this.nodes[i].z - randZ) ** 2);
+        if (d < nearDist) { nearDist = d; nearIdx = i; }
+      }
+      const near = this.nodes[nearIdx];
+      // Extend toward random point
+      const dx = randX - near.x, dz = randZ - near.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist < 0.01) continue;
+      const nx = near.x + (dx / dist) * Math.min(this.extendDist, dist);
+      const nz = near.z + (dz / dist) * Math.min(this.extendDist, dist);
+      // Check slope (reject if impassable)
+      const slope = getWorldSlope(nx, nz);
+      if (slope > 3.5) continue;
+      const stepCost = slope > 2 ? 15 : 1 + slope * 2;
+      const newCost = near.cost + Math.min(this.extendDist, dist) * stepCost;
+      if (newCost > this.maxCostSeen) this.maxCostSeen = newCost;
+      this.nodes.push({ x: nx, z: nz, parent: nearIdx, cost: newCost });
+      // Check if we reached the goal
+      const goalDist = Math.sqrt((nx - this.ex) ** 2 + (nz - this.ez) ** 2);
+      if (goalDist < this.goalRadius) {
+        // Build path by tracing parent chain
+        const path = [];
+        let idx = this.nodes.length - 1;
+        while (idx >= 0) { path.unshift([this.nodes[idx].x, this.nodes[idx].z]); idx = this.nodes[idx].parent; }
+        path.push([this.ex, this.ez]);
+        this.path = path; this.found = true; this.done = true; return;
+      }
+    }
+  }
+  getClosedPositions() {
+    // All tree nodes are "explored"
+    return this.nodes.map(n => ({ x: n.x, z: n.z, cost: n.cost }));
+  }
+  getOpenPositions() {
+    // Leaf nodes (nodes with no children) are the "frontier"
+    const hasChild = new Set();
+    for (const n of this.nodes) { if (n.parent >= 0) hasChild.add(n.parent); }
+    const leaves = [];
+    for (let i = 0; i < this.nodes.length; i++) {
+      if (!hasChild.has(i)) leaves.push({ x: this.nodes[i].x, z: this.nodes[i].z });
+    }
+    return leaves;
+  }
+}
+
+// ============ D* LITE STEPPER (Backward search from goal) ============
+class DStarLiteStepper {
+  constructor(startW, endW) {
+    this.STEP = ASTAR_STEP;
+    // D* Lite searches backward: from goal to start
+    this.sx = Math.round(endW[0] / this.STEP);  // "start" of search = goal
+    this.sz = Math.round(endW[1] / this.STEP);
+    this.ex = Math.round(startW[0] / this.STEP); // "end" of search = rover position
+    this.ez = Math.round(startW[1] / this.STEP);
+    this.realStart = startW;
+    this.realEnd = endW;
+    this.open = new Map();
+    this.closed = new Map();
+    this.gScore = new Map();
+    this.parent = new Map();
+    this.dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
+    this.done = false;
+    this.found = false;
+    this.path = null;
+    this.iters = 0;
+    this.maxCostSeen = 1;
+    const startKey = `${this.sx},${this.sz}`;
+    this.gScore.set(startKey, 0);
+    this.open.set(startKey, { x: this.sx, z: this.sz, f: this.heuristic(this.sx, this.sz) });
+  }
+  heuristic(x, z) {
+    return Math.sqrt((x - this.ex) ** 2 + (z - this.ez) ** 2) * 0.8;
+  }
+  step(n = 1) {
+    for (let s = 0; s < n; s++) {
+      if (this.done || this.open.size === 0) { this.done = true; return; }
+      this.iters++;
+      if (this.iters > 50000) { this.done = true; return; }
+      let bestKey = null, bestF = Infinity;
+      for (const [k, v] of this.open) { if (v.f < bestF) { bestF = v.f; bestKey = k; } }
+      const curr = this.open.get(bestKey);
+      this.open.delete(bestKey);
+      const cost = this.gScore.get(bestKey) || 0;
+      this.closed.set(bestKey, { x: curr.x, z: curr.z, cost });
+      if (cost > this.maxCostSeen) this.maxCostSeen = cost;
+      if (curr.x === this.ex && curr.z === this.ez) {
+        // Path found — but it's reversed (goal→start), so reverse it
+        const path = [];
+        let ck = bestKey;
+        while (ck) { const [px, pz] = ck.split(",").map(Number); path.push([px * this.STEP, pz * this.STEP]); ck = this.parent.get(ck); }
+        // path is start→goal already because we pushed (not unshifted)
+        this.path = path; this.found = true; this.done = true; return;
+      }
+      for (const [dx, dz] of this.dirs) {
+        const nx = curr.x + dx, nz = curr.z + dz;
+        const nk = `${nx},${nz}`;
+        if (this.closed.has(nk)) continue;
+        const wx = nx * this.STEP, wz = nz * this.STEP;
+        const slope = getWorldSlope(wx, wz);
+        const slopeCost = slope > 3.5 ? 200 : slope > 2 ? 15 : 1 + slope * 2;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        const ng = (this.gScore.get(bestKey) || 0) + dist * slopeCost;
+        if (!this.gScore.has(nk) || ng < this.gScore.get(nk)) {
+          this.gScore.set(nk, ng);
+          this.parent.set(nk, bestKey);
+          this.open.set(nk, { x: nx, z: nz, f: ng + this.heuristic(nx, nz) });
+        }
+      }
+    }
+  }
+  getClosedPositions() {
+    const pts = [];
+    for (const [, v] of this.closed) { pts.push({ x: v.x * this.STEP, z: v.z * this.STEP, cost: v.cost }); }
+    return pts;
+  }
+  getOpenPositions() {
+    const pts = [];
+    for (const [, v] of this.open) { pts.push({ x: v.x * this.STEP, z: v.z * this.STEP }); }
+    return pts;
+  }
+}
+
+// Algorithm registry
+const ALGORITHMS = {
+  astar: { name: "A*", color: "#00ccff", desc: "A* explores by estimated total cost (g + h). Focused beam toward goal." },
+  dijkstra: { name: "DIJKSTRA", color: "#44dd66", desc: "Dijkstra explores by cost only (no heuristic). Uniform flood expansion." },
+  rrt: { name: "RRT", color: "#ff8844", desc: "RRT grows a random tree toward the goal. Probabilistic branching pattern." },
+  dstar: { name: "D* LITE", color: "#dd44ff", desc: "D* Lite searches backward from goal to rover. Enables replanning." },
+};
+
+function createStepper(algo, startW, endW) {
+  switch (algo) {
+    case "dijkstra": return new DijkstraStepper(startW, endW);
+    case "rrt": return new RRTStepper(startW, endW);
+    case "dstar": return new DStarLiteStepper(startW, endW);
+    default: return new AStarStepper(startW, endW);
+  }
+}
+
+function instantPath(algo, startW, endW) {
+  const stepper = createStepper(algo, startW, endW);
+  stepper.step(50000);
+  return stepper.path;
+}
+
 // ============ PLANET ============
-const PLANET = {
-  name: "MARS", subtitle: "JEZERO CRATER REGION",
-  gravity: "3.72 m/s²", atmosphere: "0.6 kPa CO₂",
-  temp: "−60°C avg", windSpeed: "7.2 m/s", sol: "SOL 847",
+const PLANETS = {
+  mars: {
+    name: "MARS", subtitle: "JEZERO CRATER REGION",
+    gravity: "3.72 m/s²", atmosphere: "0.6 kPa CO₂",
+    temp: "−60°C avg", windSpeed: "7.2 m/s", sol: "SOL 847",
+    skyTop: [0.23, 0.12, 0.08], skyBot: [0.65, 0.40, 0.30],
+    fogColor: 0x9a7050, fogDensity: 0.0018,
+    sunColor: 0xffeedd, sunIntensity: 1.4,
+    clearColor: 0x8a5a38, dotColor: "#cc4422",
+    terrainColor: [0.6, 0.26, 0.11], terrainVariance: 0.3,
+    rockColors: [0x6b3a23, 0x5a3020, 0x7a4530],
+    heightScale: 1.0, roughMult: 1.0, craterMult: 1.0,
+  },
+  venus: {
+    name: "VENUS", subtitle: "APHRODITE TERRA",
+    gravity: "8.87 m/s²", atmosphere: "9200 kPa CO₂",
+    temp: "462°C avg", windSpeed: "0.3 m/s", sol: "CYCLE 12",
+    skyTop: [0.35, 0.22, 0.05], skyBot: [0.75, 0.55, 0.15],
+    fogColor: 0xaa8833, fogDensity: 0.0045,
+    sunColor: 0xffdd88, sunIntensity: 0.7,
+    clearColor: 0x8a7030, dotColor: "#ddaa22",
+    terrainColor: [0.52, 0.38, 0.10], terrainVariance: 0.2,
+    rockColors: [0x5a4a18, 0x4a3a10, 0x6a5420],
+    heightScale: 0.6, roughMult: 0.5, craterMult: 0.15,
+  },
+  europa: {
+    name: "EUROPA", subtitle: "CONAMARA CHAOS",
+    gravity: "1.31 m/s²", atmosphere: "~0 Pa O₂ trace",
+    temp: "−160°C avg", windSpeed: "0 m/s", sol: "ORBIT 2041",
+    skyTop: [0.01, 0.02, 0.06], skyBot: [0.08, 0.12, 0.18],
+    fogColor: 0x1a2a3a, fogDensity: 0.0008,
+    sunColor: 0xccddff, sunIntensity: 0.5,
+    clearColor: 0x0a1520, dotColor: "#4488cc",
+    terrainColor: [0.55, 0.62, 0.72], terrainVariance: 0.15,
+    rockColors: [0x6688aa, 0x5577a0, 0x7799bb],
+    heightScale: 0.4, roughMult: 0.8, craterMult: 0.7,
+  },
+  titan: {
+    name: "TITAN", subtitle: "KRAKEN MARE REGION",
+    gravity: "1.35 m/s²", atmosphere: "146.7 kPa N₂",
+    temp: "−179°C avg", windSpeed: "1.2 m/s", sol: "T-DAY 445",
+    skyTop: [0.15, 0.10, 0.02], skyBot: [0.45, 0.30, 0.10],
+    fogColor: 0x664422, fogDensity: 0.0035,
+    sunColor: 0xeedd99, sunIntensity: 0.4,
+    clearColor: 0x443318, dotColor: "#aa7733",
+    terrainColor: [0.35, 0.28, 0.13], terrainVariance: 0.18,
+    rockColors: [0x3a3020, 0x2a2218, 0x4a3828],
+    heightScale: 0.5, roughMult: 0.4, craterMult: 0.1,
+  },
 };
 
 // ============ LOADING ============
@@ -372,9 +689,9 @@ function LoadingScreen({ progress, stage }) {
       <div style={{ fontSize: 10, letterSpacing: 2, color: "#ffaa44", animation: "pl 1.5s ease-in-out infinite" }}>{progress}%</div>
       <div style={{ position: "absolute", bottom: 32, textAlign: "center" }}>
         <div style={{ fontSize: 8, letterSpacing: 3, opacity: 0.2, marginBottom: 5 }}>CREATED BY</div>
-        <div style={{ fontSize: 11, letterSpacing: 2, opacity: 0.45, marginBottom: 3 }}>Swan Yi Htet — <span style={{ opacity: 0.55 }}>Columbia University</span></div>
-        <div style={{ fontSize: 11, letterSpacing: 2, opacity: 0.45, marginBottom: 12 }}>David Young — <span style={{ opacity: 0.55 }}>University of Pennsylvania</span></div>
-        <div style={{ fontSize: 6, letterSpacing: 3, opacity: 0.1 }}>ORION SYSTEMS v1.0</div>
+        <div style={{ fontSize: 11, letterSpacing: 2, opacity: 0.45, marginBottom: 3 }}>Swan Yi Htet</div>
+        <div style={{ fontSize: 11, letterSpacing: 2, opacity: 0.45, marginBottom: 12 }}>David Young</div>
+        <div style={{ fontSize: 6, letterSpacing: 3, opacity: 0.1 }}>ORION SYSTEMS v2.0</div>
       </div>
     </div>
   );
@@ -408,7 +725,7 @@ function OnboardingOverlay({ onStart }) {
             <div><span style={{ color: "#00ffaa" }}>A / D</span> — Steer left/right</div>
           </div>
           <div style={{ marginTop: 8, fontSize: 9, lineHeight: 1.6, opacity: 0.45 }}>
-            <span style={{ color: "#00ccff" }}>PATHFINDING AI</span> — When you click a target, watch the A* search algorithm expand in real time. Green-to-red heat map shows traversal cost. Cyan dots show the frontier. Adjust speed with the STEPS/FRAME slider.
+            <span style={{ color: "#00ccff" }}>PATHFINDING AI</span> — Select from A*, Dijkstra, RRT, or D* Lite algorithms. Watch each search expand in real time with unique visualization patterns. Green-to-red heat map shows traversal cost. Adjust speed with the STEPS/FRAME slider.
           </div>
         </div>
         <button onClick={onStart} style={{ padding: "10px 40px", fontSize: 10, letterSpacing: 4, background: "rgba(0,255,170,0.06)", border: "1px solid rgba(0,255,170,0.25)", color: "#00ffaa", borderRadius: 3, cursor: "pointer" }}
@@ -747,6 +1064,11 @@ export default function ATHENA() {
   const [showAlgoViz, setShowAlgoViz] = useState(true);
   const [vizSpeed, setVizSpeed] = useState(60);
   const [vizStats, setVizStats] = useState({ explored: 0, frontier: 0, iters: 0 });
+  const [selectedAlgo, setSelectedAlgo] = useState("astar");
+  const [missionMode, setMissionMode] = useState(false);
+  const [waypoints, setWaypoints] = useState([]);
+  const [missionStats, setMissionStats] = useState(null);
+  const [selectedPlanet, setSelectedPlanet] = useState("mars");
   const astarStepperRef = useRef(null);
   const vizMeshesRef = useRef({ explored: null, frontier: null });
   const pathRef = useRef(null);
@@ -759,6 +1081,11 @@ export default function ATHENA() {
   const showHazardRef = useRef(false);
   const showAlgoVizRef = useRef(true);
   const vizSpeedRef = useRef(60);
+  const selectedAlgoRef = useRef("astar");
+  const missionModeRef = useRef(false);
+  const waypointsRef = useRef([]);
+  const missionPathRef = useRef(null);
+  const missionIdxRef = useRef(0);
   const chunksRef = useRef(new Map());
   const sceneRefForRebuild = useRef(null);
   const rebuildChunksRef = useRef(null);
@@ -767,6 +1094,9 @@ export default function ATHENA() {
   useEffect(() => { showHazardRef.current = showHazard; }, [showHazard]);
   useEffect(() => { showAlgoVizRef.current = showAlgoViz; }, [showAlgoViz]);
   useEffect(() => { vizSpeedRef.current = vizSpeed; }, [vizSpeed]);
+  useEffect(() => { selectedAlgoRef.current = selectedAlgo; }, [selectedAlgo]);
+  useEffect(() => { missionModeRef.current = missionMode; }, [missionMode]);
+  useEffect(() => { waypointsRef.current = waypoints; }, [waypoints]);
   useEffect(() => {
     _roughness = roughness;
     _craterDensity = craterDensity;
@@ -789,6 +1119,98 @@ export default function ATHENA() {
       rebuildChunksRef.current(rv.x, rv.z);
     }
   }, [roughness, craterDensity]);
+
+  // Update scene when planet changes
+  useEffect(() => {
+    const { renderer, scene } = sceneRef.current;
+    if (!scene || !renderer) return;
+    const p = PLANETS[selectedPlanet];
+    // Update terrain globals
+    _terrainColor = p.terrainColor;
+    _terrainColorVariance = p.terrainVariance;
+    _rockColors = p.rockColors;
+    _heightScale = p.heightScale;
+    _roughness = p.roughMult;
+    _craterDensity = p.craterMult * 0.5;
+    // Update fog
+    if (scene.fog) { scene.fog.color.setHex(p.fogColor); scene.fog.density = p.fogDensity; }
+    // Update clear color
+    renderer.setClearColor(p.clearColor);
+    // Update sky dome colors
+    scene.traverse(child => {
+      if (child.isMesh && child.material && child.material.side === THREE.BackSide && child.geometry) {
+        const skyColors = child.geometry.attributes.color;
+        if (skyColors) {
+          for (let i = 0; i < skyColors.count; i++) {
+            const y = child.geometry.attributes.position.getY(i);
+            const t = Math.max(0, Math.min(1, (y + 50) / 530));
+            const t2 = t * t;
+            skyColors.setXYZ(i,
+              p.skyBot[0] - t2 * (p.skyBot[0] - p.skyTop[0]),
+              p.skyBot[1] - t2 * (p.skyBot[1] - p.skyTop[1]),
+              p.skyBot[2] - t2 * (p.skyBot[2] - p.skyTop[2])
+            );
+          }
+          skyColors.needsUpdate = true;
+        }
+      }
+    });
+    // Update sun light
+    const sun = scene.children.find(c => c.isDirectionalLight && c.castShadow);
+    if (sun) { sun.color.setHex(p.sunColor); sun.intensity = p.sunIntensity; }
+    // Update dust particle color
+    scene.traverse(child => {
+      if (child.isPoints && child.material && child.material.size < 0.1) {
+        child.material.color.setHex(
+          selectedPlanet === "europa" ? 0x8899bb :
+          selectedPlanet === "venus" ? 0xaa8844 :
+          selectedPlanet === "titan" ? 0x887755 : 0xbb8866
+        );
+      }
+    });
+    // Rebuild all terrain chunks with new planet parameters
+    if (rebuildChunksRef.current) {
+      // Clear trail, path, and rover state
+      const { trailPts, trailLine, pathLine, markerGroup, roverGroup } = sceneRef.current;
+      if (trailPts) trailPts.length = 0;
+      if (trailLine) { trailLine.geometry.dispose(); trailLine.geometry = new THREE.BufferGeometry(); }
+      if (pathLine) { pathLine.geometry.dispose(); pathLine.geometry = new THREE.BufferGeometry(); }
+      if (markerGroup) markerGroup.visible = false;
+      pathRef.current = null;
+      roverRef.current.moving = false;
+      roverRef.current.pathIdx = 0;
+      distRef.current = 0;
+      astarStepperRef.current = null;
+      const vm = vizMeshesRef.current;
+      if (vm.exploredGeo) vm.exploredGeo.setDrawRange(0, 0);
+      if (vm.frontierGeo) vm.frontierGeo.setDrawRange(0, 0);
+      setVizStats({ explored: 0, frontier: 0, iters: 0 });
+      // Remove waypoint markers
+      const toRemove = [];
+      scene.traverse(c => { if (c.name && c.name.startsWith("waypoint_")) toRemove.push(c); });
+      toRemove.forEach(c => scene.remove(c));
+      setWaypoints([]);
+      setMissionStats(null);
+      // Rebuild chunks
+      for (const [, data] of chunksRef.current) {
+        scene.remove(data.terrain);
+        scene.remove(data.rocks);
+        scene.remove(data.hazard);
+        if (data.terrain.geometry) data.terrain.geometry.dispose();
+        if (data.terrain.material) data.terrain.material.dispose();
+        if (data.hazard.geometry) data.hazard.geometry.dispose();
+        if (data.hazard.material) data.hazard.material.dispose();
+      }
+      chunksRef.current.clear();
+      const rv = roverRef.current;
+      rv.x = 0; rv.z = 0; rv.angle = 0;
+      rebuildChunksRef.current(rv.x, rv.z);
+      // Reposition rover on new terrain
+      const { roverGroup: rg } = sceneRef.current;
+      if (rg) rg.position.set(0, getWorldHeight(0, 0) - 0.12, 0);
+      setStatus(`${p.name} — AWAITING MISSION DIRECTIVE`);
+    }
+  }, [selectedPlanet]);
 
   const buildRover = useCallback((scene) => {
     const old = scene.getObjectByName("roverGroup");
@@ -832,10 +1254,10 @@ export default function ATHENA() {
       const w = new THREE.Mesh(wg, wm); w.rotation.x = Math.PI / 2; w.position.set(x, y, z); w.name = "wheel"; g.add(w);
     });
 
-    const cone = new THREE.Mesh(new THREE.ConeGeometry(5, 8, 24, 1, true), new THREE.MeshBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.04, side: THREE.DoubleSide, depthWrite: false }));
-    cone.name = "sensorCone"; cone.rotation.x = -Math.PI / 2; cone.position.set(4.5, 0.6, 0); g.add(cone);
-    const sr = new THREE.Mesh(new THREE.RingGeometry(4.5, 5, 48), new THREE.MeshBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false }));
-    sr.name = "sensorRing"; sr.rotation.x = -Math.PI / 2; sr.position.y = 0.2; g.add(sr);
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(3, 5, 24, 1, true), new THREE.MeshBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.035, side: THREE.DoubleSide, depthWrite: false }));
+    cone.name = "sensorCone"; cone.rotation.z = -Math.PI / 2; cone.position.set(3.5, 0.5, 0); g.add(cone);
+    const sr = new THREE.Mesh(new THREE.RingGeometry(2.8, 3.1, 48), new THREE.MeshBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false }));
+    sr.name = "sensorRing"; sr.rotation.x = -Math.PI / 2; sr.position.set(1, 0.15, 0); g.add(sr);
     const rLight = new THREE.PointLight(0xffeedd, 0.3, 5);
     rLight.position.set(0, 1.5, 0); g.add(rLight);
 
@@ -1073,22 +1495,43 @@ export default function ATHENA() {
       if (hits.length > 0) {
         const p = hits[0].point;
         const rv = roverRef.current;
+
+        // Mission mode: accumulate waypoints
+        if (missionModeRef.current) {
+          const wp = { x: p.x, z: p.z, y: getWorldHeight(p.x, p.z) };
+          setWaypoints(prev => [...prev, wp]);
+          // Add a visual marker for this waypoint
+          const wpMarker = new THREE.Group();
+          wpMarker.name = `waypoint_${Date.now()}`;
+          const wpBeam = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 6, 8), new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.3 }));
+          wpBeam.position.y = 3;
+          wpMarker.add(wpBeam);
+          const wpRing = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.7, 32), new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.4, side: THREE.DoubleSide }));
+          wpRing.rotation.x = -Math.PI / 2; wpRing.position.y = 0.15;
+          wpMarker.add(wpRing);
+          wpMarker.position.set(wp.x, wp.y, wp.z);
+          scene.add(wpMarker);
+          setStatus(`WAYPOINT ${waypointsRef.current.length + 1} SET — CLICK MORE OR EXECUTE`);
+          return;
+        }
+
         setStatus("COMPUTING OPTIMAL PATH...");
         setTimeout(() => {
           if (showAlgoVizRef.current) {
-            // Use step-by-step visualization
-            astarStepperRef.current = new AStarStepper([rv.x, rv.z], [p.x, p.z]);
+            // Use step-by-step visualization with selected algorithm
+            astarStepperRef.current = createStepper(selectedAlgoRef.current, [rv.x, rv.z], [p.x, p.z]);
             // Clear viz
             const vm = vizMeshesRef.current;
             if (vm.exploredGeo) vm.exploredGeo.setDrawRange(0, 0);
             if (vm.frontierGeo) vm.frontierGeo.setDrawRange(0, 0);
-            setStatus("A* SEARCH EXPANDING...");
+            const algoInfo = ALGORITHMS[selectedAlgoRef.current];
+            setStatus(`${algoInfo.name} SEARCH EXPANDING...`);
             setVizStats({ explored: 0, frontier: 0, iters: 0 });
             markerGroup.position.set(p.x, getWorldHeight(p.x, p.z), p.z);
             markerGroup.visible = true;
           } else {
-            // Instant pathfind
-            const raw = astarPathInstant([rv.x, rv.z], [p.x, p.z]);
+            // Instant pathfind with selected algorithm
+            const raw = instantPath(selectedAlgoRef.current, [rv.x, rv.z], [p.x, p.z]);
             if (raw) {
               const path = smoothPath(smoothPath(raw));
               pathRef.current = path; rv.pathIdx = 0; rv.moving = true; distRef.current = 0;
@@ -1351,6 +1794,49 @@ export default function ATHENA() {
     setStatus("NEW TERRAIN — AWAITING DIRECTIVE");
   };
 
+  const executeMission = () => {
+    if (waypoints.length === 0) return;
+    const rv = roverRef.current;
+    const { scene, pathLine, markerGroup } = sceneRef.current;
+    // Build full path: rover → wp1 → wp2 → ... → wpN
+    const allPoints = [{ x: rv.x, z: rv.z }, ...waypoints];
+    let fullPath = [];
+    let totalCost = 0;
+    let blocked = false;
+    for (let i = 0; i < allPoints.length - 1; i++) {
+      const raw = instantPath(selectedAlgoRef.current, [allPoints[i].x, allPoints[i].z], [allPoints[i + 1].x, allPoints[i + 1].z]);
+      if (!raw) { blocked = true; break; }
+      const seg = smoothPath(smoothPath(raw));
+      fullPath = fullPath.concat(i === 0 ? seg : seg.slice(1));
+    }
+    if (blocked) { setStatus("MISSION BLOCKED — UNREACHABLE WAYPOINT"); return; }
+    // Calculate mission stats
+    let totalDist = 0;
+    for (let i = 1; i < fullPath.length; i++) {
+      totalDist += Math.sqrt((fullPath[i][0] - fullPath[i - 1][0]) ** 2 + (fullPath[i][1] - fullPath[i - 1][1]) ** 2);
+    }
+    setMissionStats({ waypoints: waypoints.length, totalDist: totalDist.toFixed(1), legs: waypoints.length });
+    pathRef.current = fullPath; rv.pathIdx = 0; rv.moving = true; distRef.current = 0;
+    setStatus(`MISSION ACTIVE — ${waypoints.length} WAYPOINTS`);
+    const pts = fullPath.map(([px, pz]) => new THREE.Vector3(px, getWorldHeight(px, pz) + 0.3, pz));
+    pathLine.geometry.dispose(); pathLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+    markerGroup.visible = false;
+    setMissionMode(false);
+  };
+
+  const clearMission = () => {
+    const { scene } = sceneRef.current;
+    if (scene) {
+      // Remove waypoint markers
+      const toRemove = [];
+      scene.traverse(c => { if (c.name && c.name.startsWith("waypoint_")) toRemove.push(c); });
+      toRemove.forEach(c => scene.remove(c));
+    }
+    setWaypoints([]);
+    setMissionStats(null);
+    setStatus("MISSION CLEARED — AWAITING DIRECTIVE");
+  };
+
   const P = { background: "rgba(8,4,2,0.82)", border: "1px solid rgba(255,170,80,0.08)", borderRadius: 3, backdropFilter: "blur(10px)" };
 
   return (
@@ -1364,15 +1850,15 @@ export default function ATHENA() {
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
               <div style={{ width: 5, height: 5, borderRadius: "50%", background: roverRef.current?.moving ? "#00ffaa" : "#ffaa00", boxShadow: `0 0 5px ${roverRef.current?.moving ? "#00ffaa" : "#ffaa00"}` }} />
-              <span style={{ fontSize: 8, letterSpacing: 3.5, opacity: 0.25 }}>ORION SUBSYSTEM v1.0</span>
+              <span style={{ fontSize: 8, letterSpacing: 3.5, opacity: 0.25 }}>ORION SUBSYSTEM v2.0</span>
             </div>
             <div style={{ fontSize: 17, fontWeight: "bold", letterSpacing: 5, color: "#ffd4a0", marginTop: 1 }}>ATHENA</div>
           </div>
           <div style={{ ...P, padding: "5px 11px", display: "flex", alignItems: "center", gap: 7 }}>
-            <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#cc4422", boxShadow: "0 0 5px #cc4422" }} />
+            <div style={{ width: 7, height: 7, borderRadius: "50%", background: PLANETS[selectedPlanet].dotColor, boxShadow: `0 0 5px ${PLANETS[selectedPlanet].dotColor}` }} />
             <div>
-              <div style={{ fontSize: 11, letterSpacing: 2.5, color: "#ff8855", fontWeight: "bold" }}>MARS</div>
-              <div style={{ fontSize: 6, letterSpacing: 1.5, opacity: 0.3 }}>{PLANET.subtitle}</div>
+              <div style={{ fontSize: 11, letterSpacing: 2.5, color: "#ff8855", fontWeight: "bold" }}>{PLANETS[selectedPlanet].name}</div>
+              <div style={{ fontSize: 6, letterSpacing: 1.5, opacity: 0.3 }}>{PLANETS[selectedPlanet].subtitle}</div>
             </div>
           </div>
         </div>
@@ -1387,7 +1873,20 @@ export default function ATHENA() {
 
       <div style={{ position: "absolute", top: 300, left: 10, width: 140, zIndex: 10, ...P, padding: 9 }}>
         <div style={{ fontSize: 7, letterSpacing: 2, color: "#ffaa44", marginBottom: 6 }}>ENVIRONMENT</div>
-        {[["GRAVITY", PLANET.gravity], ["ATMO", PLANET.atmosphere], ["TEMP", PLANET.temp], ["WIND", PLANET.windSpeed], ["MISSION", PLANET.sol]].map(([l, v]) => (
+        <div style={{ marginBottom: 6 }}>
+          <div style={{ fontSize: 6, opacity: 0.35, marginBottom: 3, letterSpacing: 1 }}>PLANET SELECT</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2 }}>
+            {Object.entries(PLANETS).map(([key, p]) => (
+              <button key={key} onClick={() => setSelectedPlanet(key)} style={{
+                padding: "2px 0", fontSize: 6, letterSpacing: 0.5,
+                background: selectedPlanet === key ? `${p.dotColor}20` : "rgba(255,255,255,0.015)",
+                border: selectedPlanet === key ? `1px solid ${p.dotColor}50` : "1px solid rgba(255,255,255,0.03)",
+                color: selectedPlanet === key ? p.dotColor : "#554433", borderRadius: 2, cursor: "pointer",
+              }}>{p.name}</button>
+            ))}
+          </div>
+        </div>
+        {[["GRAVITY", PLANETS[selectedPlanet].gravity], ["ATMO", PLANETS[selectedPlanet].atmosphere], ["TEMP", PLANETS[selectedPlanet].temp], ["WIND", PLANETS[selectedPlanet].windSpeed], ["MISSION", PLANETS[selectedPlanet].sol]].map(([l, v]) => (
           <div key={l} style={{ marginBottom: 2 }}><div style={{ fontSize: 6, letterSpacing: 1.5, opacity: 0.22 }}>{l}</div><div style={{ fontSize: 10, letterSpacing: 0.5 }}>{v}</div></div>
         ))}
       </div>
@@ -1398,7 +1897,7 @@ export default function ATHENA() {
           <div style={{ fontSize: 7, opacity: 0.35, marginBottom: 3 }}>OVERLAYS</div>
           <div style={{ display: "flex", gap: 3 }}>
             <button onClick={() => setShowSensor(!showSensor)} style={{ flex: 1, padding: "3px 0", fontSize: 7, letterSpacing: 1, background: showSensor ? "rgba(0,255,170,0.08)" : "rgba(255,255,255,0.015)", border: showSensor ? "1px solid rgba(0,255,170,0.22)" : "1px solid rgba(255,255,255,0.03)", color: showSensor ? "#00ffaa" : "#554433", borderRadius: 2, cursor: "pointer" }}>SENSOR</button>
-            <button onClick={() => setShowHazard(!showHazard)} style={{ flex: 1, padding: "3px 0", fontSize: 7, letterSpacing: 1, background: showHazard ? "rgba(255,170,0,0.08)" : "rgba(255,255,255,0.015)", border: showHazard ? "1px solid rgba(255,170,0,0.22)" : "1px solid rgba(255,255,255,0.03)", color: showHazard ? "#ffaa00" : "#554433", borderRadius: 2, cursor: "pointer" }}>HAZARD</button>
+            <button onClick={() => setShowHazard(!showHazard)} style={{ flex: 1, padding: "3px 0", fontSize: 7, letterSpacing: 1, background: showHazard ? "rgba(255,170,0,0.08)" : "rgba(255,255,255,0.015)", border: showHazard ? "1px solid rgba(255,170,0,0.22)" : "1px solid rgba(255,255,255,0.03)", color: showHazard ? "#ffaa00" : "#554433", borderRadius: 2, cursor: "pointer" }}>TERRAIN</button>
           </div>
         </div>
         <div style={{ marginBottom: 6 }}>
@@ -1410,35 +1909,77 @@ export default function ATHENA() {
           <input type="range" min="0" max="1" step="0.1" value={craterDensity} onChange={e => setCraterDensity(parseFloat(e.target.value))} style={{ width: "100%", accentColor: "#ffaa00", height: 2 }} />
         </div>
         <button onClick={regenerate} style={{ width: "100%", padding: "4px 0", fontSize: 7, letterSpacing: 3, background: "rgba(255,170,0,0.04)", border: "1px solid rgba(255,170,0,0.15)", color: "#ffaa00", borderRadius: 2, cursor: "pointer", marginBottom: 4 }}>REGENERATE</button>
-        <button onClick={() => setShowOnboarding(true)} style={{ width: "100%", padding: "4px 0", fontSize: 7, letterSpacing: 2, background: "rgba(255,255,255,0.01)", border: "1px solid rgba(255,255,255,0.03)", color: "#554433", borderRadius: 2, cursor: "pointer" }}>VIEW CONTROLS</button>
+        <button onClick={() => setShowOnboarding(true)} style={{ width: "100%", padding: "4px 0", fontSize: 7, letterSpacing: 2, background: "rgba(255,255,255,0.01)", border: "1px solid rgba(255,255,255,0.03)", color: "#554433", borderRadius: 2, cursor: "pointer", marginBottom: 8 }}>VIEW CONTROLS</button>
+
+        <div style={{ fontSize: 7, opacity: 0.35, marginBottom: 3 }}>MISSION PLANNING</div>
+        <button onClick={() => { setMissionMode(!missionMode); if (missionMode) clearMission(); }} style={{
+          width: "100%", padding: "3px 0", fontSize: 7, letterSpacing: 1,
+          background: missionMode ? "rgba(255,170,0,0.1)" : "rgba(255,255,255,0.015)",
+          border: missionMode ? "1px solid rgba(255,170,0,0.25)" : "1px solid rgba(255,255,255,0.03)",
+          color: missionMode ? "#ffaa00" : "#554433", borderRadius: 2, cursor: "pointer", marginBottom: 3,
+        }}>{missionMode ? `PLANNING — ${waypoints.length} WP` : "MULTI-WAYPOINT"}</button>
+        {missionMode && waypoints.length > 0 && (
+          <div style={{ display: "flex", gap: 3 }}>
+            <button onClick={executeMission} style={{ flex: 1, padding: "3px 0", fontSize: 7, letterSpacing: 1, background: "rgba(0,255,170,0.08)", border: "1px solid rgba(0,255,170,0.25)", color: "#00ffaa", borderRadius: 2, cursor: "pointer" }}>EXECUTE</button>
+            <button onClick={clearMission} style={{ flex: 1, padding: "3px 0", fontSize: 7, letterSpacing: 1, background: "rgba(255,68,68,0.08)", border: "1px solid rgba(255,68,68,0.2)", color: "#ff4444", borderRadius: 2, cursor: "pointer" }}>CLEAR</button>
+          </div>
+        )}
+        {missionStats && (
+          <div style={{ marginTop: 4 }}>
+            {[
+              ["WAYPOINTS", missionStats.waypoints, "#ffaa00"],
+              ["TOTAL DIST", `${missionStats.totalDist} m`, "#00ffaa"],
+            ].map(([l, v, c]) => (
+              <div key={l} style={{ marginBottom: 1 }}>
+                <div style={{ fontSize: 6, letterSpacing: 1.5, opacity: 0.22 }}>{l}</div>
+                <div style={{ fontSize: 9, letterSpacing: 0.5, color: c, fontFamily: "monospace" }}>{v}</div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* ALGORITHM VISUALIZATION PANEL */}
       <div style={{ position: "absolute", top: 340, right: 10, width: 170, zIndex: 10, ...P, padding: 9 }}>
-        <div style={{ fontSize: 7, letterSpacing: 2, color: "#00ccff", marginBottom: 7 }}>PATHFINDING AI</div>
+        <div style={{ fontSize: 7, letterSpacing: 2, color: ALGORITHMS[selectedAlgo].color, marginBottom: 7 }}>PATHFINDING AI</div>
+
+        {/* Algorithm selector */}
+        <div style={{ marginBottom: 7 }}>
+          <div style={{ fontSize: 7, opacity: 0.4, marginBottom: 3 }}>ALGORITHM</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2 }}>
+            {Object.entries(ALGORITHMS).map(([key, algo]) => (
+              <button key={key} onClick={() => setSelectedAlgo(key)} style={{
+                padding: "3px 0", fontSize: 6, letterSpacing: 0.8,
+                background: selectedAlgo === key ? `${algo.color}15` : "rgba(255,255,255,0.015)",
+                border: selectedAlgo === key ? `1px solid ${algo.color}40` : "1px solid rgba(255,255,255,0.03)",
+                color: selectedAlgo === key ? algo.color : "#554433", borderRadius: 2, cursor: "pointer",
+              }}>{algo.name}</button>
+            ))}
+          </div>
+        </div>
 
         <div style={{ marginBottom: 7 }}>
           <div style={{ fontSize: 7, opacity: 0.4, marginBottom: 3 }}>SEARCH VISUALIZATION</div>
           <button onClick={() => setShowAlgoViz(!showAlgoViz)} style={{
             width: "100%", padding: "3px 0", fontSize: 7, letterSpacing: 1,
-            background: showAlgoViz ? "rgba(0,204,255,0.1)" : "rgba(255,255,255,0.015)",
-            border: showAlgoViz ? "1px solid rgba(0,204,255,0.25)" : "1px solid rgba(255,255,255,0.03)",
-            color: showAlgoViz ? "#00ccff" : "#554433", borderRadius: 2, cursor: "pointer",
+            background: showAlgoViz ? `${ALGORITHMS[selectedAlgo].color}18` : "rgba(255,255,255,0.015)",
+            border: showAlgoViz ? `1px solid ${ALGORITHMS[selectedAlgo].color}40` : "1px solid rgba(255,255,255,0.03)",
+            color: showAlgoViz ? ALGORITHMS[selectedAlgo].color : "#554433", borderRadius: 2, cursor: "pointer",
           }}>{showAlgoViz ? "VIZ ON — CLICK TO SET TARGET" : "VIZ OFF — INSTANT PATH"}</button>
         </div>
 
         <div style={{ marginBottom: 7 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 7, opacity: 0.35, marginBottom: 2 }}>
-            <span>STEPS/FRAME</span><span style={{ color: "#00ccff" }}>{vizSpeed}</span>
+            <span>STEPS/FRAME</span><span style={{ color: ALGORITHMS[selectedAlgo].color }}>{vizSpeed}</span>
           </div>
-          <input type="range" min="5" max="300" step="5" value={vizSpeed} onChange={e => setVizSpeed(parseInt(e.target.value))} style={{ width: "100%", accentColor: "#00ccff", height: 2 }} />
+          <input type="range" min="5" max="300" step="5" value={vizSpeed} onChange={e => setVizSpeed(parseInt(e.target.value))} style={{ width: "100%", accentColor: ALGORITHMS[selectedAlgo].color, height: 2 }} />
         </div>
 
         {/* Live search stats */}
         <div style={{ marginBottom: 4 }}>
           {[
-            ["EXPLORED", vizStats.explored, "#44dd66"],
-            ["FRONTIER", vizStats.frontier, "#00ccff"],
+            [selectedAlgo === "rrt" ? "TREE NODES" : "EXPLORED", vizStats.explored, "#44dd66"],
+            [selectedAlgo === "rrt" ? "LEAF NODES" : "FRONTIER", vizStats.frontier, ALGORITHMS[selectedAlgo].color],
             ["ITERATIONS", vizStats.iters, "#e8c8a0"],
           ].map(([label, val, color]) => (
             <div key={label} style={{ marginBottom: 2 }}>
@@ -1458,19 +1999,34 @@ export default function ATHENA() {
         </div>
 
         <div style={{ fontSize: 5.5, lineHeight: 1.5, opacity: 0.2, letterSpacing: 0.3, fontFamily: "monospace" }}>
-          A* explores nodes by estimated total cost (g + h). Green = cheap flat terrain. Red = expensive steep slopes. Cyan frontier = nodes queued for evaluation.
+          {ALGORITHMS[selectedAlgo].desc}
         </div>
       </div>
 
       {showHazard && (
-        <div style={{ position: "absolute", bottom: 48, left: 10, zIndex: 10, ...P, padding: 8 }}>
-          <div style={{ fontSize: 7, letterSpacing: 1.5, opacity: 0.25, marginBottom: 4 }}>HAZARD MAP</div>
-          {[{ c: "#22cc44", l: "TRAVERSABLE" }, { c: "#ffaa00", l: "CAUTION" }, { c: "#ff3333", l: "IMPASSABLE" }].map(({ c, l }) => (
-            <div key={l} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 1 }}>
-              <div style={{ width: 5, height: 5, borderRadius: 1, background: c, flexShrink: 0 }} />
-              <span style={{ fontSize: 6, letterSpacing: 1, opacity: 0.45 }}>{l}</span>
+        <div style={{ position: "absolute", bottom: 48, left: 10, zIndex: 10, ...P, padding: 10, width: 150 }}>
+          <div style={{ fontSize: 7, letterSpacing: 2, color: "#ffaa44", marginBottom: 6 }}>TERRAIN ANALYSIS</div>
+          <div style={{ fontSize: 6, letterSpacing: 1.5, opacity: 0.3, marginBottom: 3 }}>SLOPE GRADIENT</div>
+          <div style={{ height: 8, borderRadius: 2, background: "linear-gradient(90deg, rgba(25,217,76,0.6), rgba(200,200,0,0.7), rgba(255,170,0,0.8), rgba(255,60,30,0.9))", marginBottom: 2 }} />
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 5, opacity: 0.3, marginBottom: 8 }}>
+            <span>0° FLAT</span><span>15° MODERATE</span><span>35°+ STEEP</span>
+          </div>
+          <div style={{ fontSize: 6, letterSpacing: 1.5, opacity: 0.3, marginBottom: 4 }}>TRAVERSABILITY</div>
+          {[
+            { c: "rgba(25,217,76,0.5)", l: "SAFE", s: "< 10° slope" },
+            { c: "rgba(230,200,0,0.6)", l: "CAUTION", s: "10-20° slope" },
+            { c: "rgba(255,140,0,0.7)", l: "HAZARDOUS", s: "20-30° slope" },
+            { c: "rgba(255,50,30,0.85)", l: "IMPASSABLE", s: "> 30° slope" },
+          ].map(({ c, l, s }) => (
+            <div key={l} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 2 }}>
+              <div style={{ width: 6, height: 6, borderRadius: 1, background: c, flexShrink: 0 }} />
+              <span style={{ fontSize: 6, letterSpacing: 0.8, opacity: 0.5, flex: 1 }}>{l}</span>
+              <span style={{ fontSize: 5, opacity: 0.25, fontFamily: "monospace" }}>{s}</span>
             </div>
           ))}
+          <div style={{ marginTop: 6, fontSize: 5, lineHeight: 1.5, opacity: 0.18, fontFamily: "monospace" }}>
+            Overlay shows continuous slope analysis across terrain. Opacity increases with hazard severity. Toggle with HAZARD button.
+          </div>
         </div>
       )}
 
